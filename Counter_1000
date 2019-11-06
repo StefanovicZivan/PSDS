@@ -1,0 +1,61 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+-- Uncomment the following library declaration if using
+-- arithmetic functions with Signed or Unsigned values
+--use IEEE.NUMERIC_STD.ALL;
+
+-- Uncomment the following library declaration if instantiating
+-- any Xilinx leaf cells in this code.
+--library UNISIM;
+--use UNISIM.VComponents.all;
+
+entity Dec_counter_1000 is
+    Port ( CLK : in STD_LOGIC;
+           EN : in STD_LOGIC;
+           RESET : in STD_LOGIC;
+           O : out STD_LOGIC_VECTOR (11 downto 0);
+           PULSE : out STD_LOGIC);
+end Dec_counter_1000;
+
+architecture Struct of Dec_counter_1000 is
+
+signal u1,u2 : std_logic;
+signal q1,q2,q3 : std_logic_vector(3 downto 0);
+
+begin
+
+  lsb_biti: entity work.Dec_counter(Behavioral)
+                    port map(
+                            clk => CLK,
+                            en => EN,
+                            reset => RESET,
+                            q => q3,
+                            pulse => u2);
+
+    biti: entity work.Dec_counter(Behavioral)
+                    port map(
+                            clk => u2,
+                            en => EN,
+                            reset => RESET,
+                            q => q2,
+                            pulse => u1);
+                            
+ msb_biti: entity work.Dec_counter(Behavioral)
+                    port map(
+                            clk => u1,
+                            en => EN,
+                            reset => RESET,
+                            q => q1,
+                            pulse => PULSE);
+
+
+                            O(3 downto 0) <= q3;
+                            O(7 downto 4) <= q2;
+                            O(11 downto 8) <= q1;
+
+
+
+
+
+end Struct;
