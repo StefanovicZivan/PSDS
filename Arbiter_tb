@@ -1,0 +1,45 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+-- Uncomment the following library declaration if using
+-- arithmetic functions with Signed or Unsigned values
+--use IEEE.NUMERIC_STD.ALL;
+
+-- Uncomment the following library declaration if instantiating
+-- any Xilinx leaf cells in this code.
+--library UNISIM;
+--use UNISIM.VComponents.all;
+
+entity Arbiter_tb is
+--  Port ( );
+end Arbiter_tb;
+
+architecture Behavioral of Arbiter_tb is
+
+    signal g0_s,g1_s,r1_s,r0_s,clk_s: std_logic;
+
+begin
+    ee: entity work.Arbiter(Behavioral)
+        port map(
+                g0 => g0_s,
+                g1 => g1_s,
+                r0 => r0_s,
+                r1 => r1_s,
+                clk => clk_s );
+                
+        clk_gen: process
+                        begin
+                            clk_s <= '0', '1' after 5 ns;
+                            wait for 10 ns;
+                        end process;
+                
+                        stim_gen: process
+                        begin
+                            r1_s <= '0', '1' after 22 ns, '1' after 42 ns, '0' after 62 ns, '0' after 82 ns,'1' after 102 ns,'1' after 142 ns,'0' after 300 ns;
+                            r0_s <= '0', '0' after 22 ns, '1' after 42 ns, '1' after 62 ns, '0' after 82 ns,'0' after 102 ns,'1' after 122 ns,'0' after 250 ns;
+                        wait;
+                        end process;
+
+
+end Behavioral;
