@@ -1,0 +1,96 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.STD_LOGIC_unsigned.ALL;
+
+-- Uncomment the following library declaration if using
+-- arithmetic functions with Signed or Unsigned values
+--use IEEE.NUMERIC_STD.ALL;
+
+-- Uncomment the following library declaration if instantiating
+-- any Xilinx leaf cells in this code.
+--library UNISIM;
+--use UNISIM.VComponents.all;
+
+entity divider is
+    Port ( clk : in STD_LOGIC;
+           a_in : in STD_LOGIC_VECTOR (7 downto 0);
+           b_in : in STD_LOGIC_VECTOR (7 downto 0);
+           start : in STD_LOGIC;
+           ready : out STD_LOGIC;
+           r : out STD_LOGIC_VECTOR (7 downto 0);
+           q : out STD_LOGIC_VECTOR (7 downto 0));
+end divider;
+
+architecture Behavioral of divider is
+
+    type state_type is (idle,op);
+    signal state_reg, state_next : state_type;
+    signal op1_reg,op1_next : std_logic_vector(7 downto 0); 
+    signal op2_reg,op2_next : std_logic_vector(7 downto 0); 
+    signal q_reg,q_next : std_logic_vector(7 downto 0); 
+    signal r_reg,r_next : std_logic_vector(7 downto 0); 
+    signal res_reg,res_next : std_logic_vector(7 downto 0);
+
+begin
+
+    process(clk) is
+    begin
+        if(clk='1' and clk'event) then
+            state_reg <= state_next;
+            op1_reg <= op1_next;
+            op2_reg <= op2_next;
+            q_reg <= q_next;
+            r_reg <= r_next;  
+            res_reg <= res_next;            
+        end if;
+    end process;
+
+    process(start,a_in,b_in,clk,op1_reg,op2_reg,state_reg,r_reg,q_reg,res_reg) is
+    begin
+        
+        op1_next <= op1_reg;
+        op2_next <= op2_reg;
+        q_next <= q_reg;
+        r_next <= r_reg;
+        res_next <= res_reg;
+        ready <= '0';
+        
+        case state_reg is
+            when idle =>
+                ready <= '1';
+                if(start='1') then
+                    if(a_in>b_in) then
+                        op1_next <= a_in;
+                        op2_next <= b_in;
+                        q_next <= (others => '0');
+                        r_next <= (others => '0');
+                        state_next <= op;
+                    else
+                        op1_next <= b_in;
+                        op2_next <= a_in;
+                        q_next <= (others => '0');
+                        r_next <= (others => '0');
+                        state_next <= op;
+                    end if;
+                else 
+                    state_next <= idle;
+                end if;               
+            when op =>   
+                if(op1_reg>=op2_reg) then 
+                    op1_next <= op1_reg - op2_reg;
+                    q_next <= q_reg + 1;  
+                    state_next <= op; 
+                    res_next <=  (others => '0');
+                else
+                    r_next <= op1_reg;
+                    res_next <= q_reg;
+                    state_next <= idle;
+                end if;
+        end case;
+    end process;
+    
+    q <= res_reg;
+    r <= r_reg;
+    
+end Behavioral;
