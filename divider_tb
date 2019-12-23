@@ -1,0 +1,50 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+-- Uncomment the following library declaration if using
+-- arithmetic functions with Signed or Unsigned values
+--use IEEE.NUMERIC_STD.ALL;
+
+-- Uncomment the following library declaration if instantiating
+-- any Xilinx leaf cells in this code.
+--library UNISIM;
+--use UNISIM.VComponents.all;
+
+entity divider_tb is
+--  Port ( );
+end divider_tb;
+
+architecture Behavioral of divider_tb is
+
+    signal a_in_s,b_in_s,q_s,r_s : std_logic_vector(7 downto 0);
+    signal clk_s,start_s,ready_s : std_logic;
+    
+begin
+
+   ee: entity work.divider(Behavioral)
+        port map(
+            a_in => a_in_s,
+            b_in => b_in_s,
+            q => q_s,
+            r => r_s,
+            clk => clk_s,
+            
+            start => start_s,
+            ready => ready_s);
+            
+    clk_gen: process
+        begin
+            clk_s <= '0', '1' after 10 ns;
+            wait for 20 ns;
+        end process;
+        
+     stim_gen: process
+        begin
+            start_s <= '1';
+            a_in_s <= "00100000", "00100010" after 100 ns, "00000101" after 340 ns;
+            b_in_s <= "00001000", "00000111" after 220 ns, "00010100" after 340 ns, "00001000" after 420 ns;
+        wait;
+        end process;
+        
+end Behavioral;  
