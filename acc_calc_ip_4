@@ -1,0 +1,1681 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+-- Uncomment the following library declaration if using
+-- arithmetic functions with Signed or Unsigned values
+use IEEE.NUMERIC_STD.ALL;
+--use IEEE.STD_LOGIC_UNSIGNED.ALL;
+
+-- Uncomment the following library declaration if instantiating
+-- any Xilinx leaf cells in this code.
+--library UNISIM;
+--use UNISIM.VComponents.all;
+
+entity acc_calc_ip is
+  port (clk   : in  std_logic;
+        areset : in std_logic;
+        --axi stream master interface for sending data to dma
+        m_valid : out std_logic;
+        m_ready : in std_logic;
+        --m_last : out std_logic;
+        m_data_out : out std_logic_vector(31 downto 0);
+        --axi stream slave interface for reciving data from dma
+        s_ready : out std_logic; 
+        s_valid : in std_logic;
+        s_last : in std_logic;
+        s_data_in : in std_logic_vector(31 downto 0));
+            
+end acc_calc_ip;
+
+architecture Behavioral of acc_calc_ip is
+  --Sine and cosine result
+  signal sin_output_s : signed(9 downto 0);
+  signal cos_output_s : signed(9 downto 0);
+
+  --Results of multiplying the radius r with the cosine and sine results
+  signal r1_sin_res_s : signed(19 downto 0);
+  signal r2_cos_res_s : signed(19 downto 0);
+
+  --Non quantized signals
+  signal a_nq_s : signed(19 downto 0);
+  signal b_nq_s : signed(19 downto 0);
+
+  --Quantized signals
+  signal a_q_s : signed(9 downto 0);
+  signal b_q_s : signed(9 downto 0);
+  
+  --a constant used to check if the data contains a radius value
+  constant RAD_PIX_MASK : std_logic_vector(31 downto 0 ) := "10000000000000000000000000000000"; 
+  --a constant to check if the data is valid
+  constant INVALID_PIX_MASK : std_logic_vector(31 downto 0 ) := "10000000000000000000000000000000"; 
+  --it is used to check if the theta has reached 360
+  constant full_circle : std_logic_vector(9 downto 0) := "0101101000";
+  
+  --Register signals
+  type state_type is (mm2s, s2mm, idle);
+  signal state_reg, state_next : state_type;                            --State register
+  signal theta_reg, theta_next : std_logic_vector(9 downto 0);          --Angle manipulation register
+  signal radius_reg, radius_next : std_logic_vector(9 downto 0);        --Radius storage register
+  signal data_out_reg, data_out_next : std_logic_vector(31 downto 0);   --Out data storage register 
+  signal address_reg, address_next : std_logic_vector(3 downto 0);      --Internal buffer addressing register
+  signal valid_out_reg, valid_out_next : std_logic_vector(1 downto 0);  --Register used to offset _valid signals due to pipelining
+  
+  --Registers for storing results during arithmetic operations
+  signal r1_reg, r1_next : std_logic_vector(19 downto 0); 
+  signal r2_reg, r2_next : std_logic_vector(19 downto 0); 
+  signal sin_reg, sin_next : std_logic_vector(9 downto 0); 
+  signal cos_reg, cos_next : std_logic_vector(9 downto 0); 
+  
+  --Internal buffers to store the x and y positions of the pixels
+  type reg_file_x is array (0 to 15) of std_logic_vector(9 downto 0);
+  signal file_x_reg, file_x_next : reg_file_x;
+  type reg_file_y is array (0 to 15) of std_logic_vector(9 downto 0);
+  signal file_y_reg, file_y_next: reg_file_y;
+  
+begin
+  -- state and data registers 
+  reg_process : process (clk, areset) is
+  begin 
+    if areset = '0' then              -- asynchronous reset (active low)
+      state_reg <= idle;             
+      theta_reg <= (others => '0');
+      radius_reg <= (others => '0');
+      address_reg <= (others => '0');
+      r1_reg <= (others => '0');
+      r2_reg <= (others => '0');
+      sin_reg <= (others => '0');
+      cos_reg <= (others => '0');
+      valid_out_reg <= (others => '0');
+      data_out_reg <= (others => '0');
+      file_x_reg <= (others =>(others => '0'));
+      file_y_reg <= (others =>(others => '0'));
+    elsif clk'event and clk = '1' then  -- rising clock edge
+      state_reg <= state_next;
+      theta_reg <= theta_next;
+      radius_reg <= radius_next;
+      r1_reg <= r1_next;
+      r2_reg <= r2_next;
+      sin_reg <= sin_next;
+      cos_reg <= cos_next;
+      valid_out_reg <= valid_out_next;
+      data_out_reg <= data_out_next;
+      address_reg <= address_next;
+      file_x_reg <= file_x_next;
+      file_y_reg <= file_y_next;
+    end if;
+  end process reg_process;
+  
+  sequential_logic : process(m_ready, s_valid, state_reg, theta_reg, areset, s_last, address_reg, data_out_reg, sin_output_s, valid_out_reg, 
+                 cos_output_s, s_data_in, radius_reg, r1_sin_res_s, r2_cos_res_s, b_q_s, a_q_s, file_x_reg, file_y_reg ) is
+  begin
+    -- default assignments
+    state_next <= state_reg;
+    theta_next <= theta_reg;
+    radius_next <= radius_reg; 
+    address_next <= address_reg;
+    file_x_next <= file_x_reg;
+    file_y_next <= file_y_reg;
+    s_ready <= '0';
+    m_valid <= '0';
+    data_out_next <= data_out_reg;
+    valid_out_next <= valid_out_reg;
+    r1_next <= std_logic_vector(r1_sin_res_s);
+    r2_next <= std_logic_vector(r2_cos_res_s);
+    sin_next <= std_logic_vector(sin_output_s);
+    cos_next <= std_logic_vector(cos_output_s);
+    
+    case state_reg is
+      --a state entered after an asynchronous reset
+      when idle =>
+        if(areset = '1') then
+          state_next <= mm2s;
+        end if;
+        
+      --a state for recived data from RAM memory
+      when mm2s =>
+        s_ready <= '1';
+        if(s_valid = '1') then
+          --check if the data contains a radius value
+          if((s_data_in and RAD_PIX_MASK) = RAD_PIX_MASK) then
+            radius_next <= s_data_in(9 downto 0);
+          else
+          --extracting x and y positions and placing in internal buffers
+            file_x_next(to_integer(unsigned(address_reg))) <= s_data_in(9 downto 0);
+            file_y_next(to_integer(unsigned(address_reg))) <= s_data_in(19 downto 10);
+            --manipulation of the address register
+            if((address_reg = "1111") or (s_last = '1')) then
+              state_next <= s2mm;
+            else
+              address_next <= std_logic_vector(unsigned(address_reg) + 1); 
+            end if; 
+          end if;     
+        end if;
+        
+      --state for calculating and sending data to the RAM memory
+      when s2mm =>
+        --timely activation of m_valid signal
+        if(valid_out_reg = "11") then
+          m_valid <= '1';
+        end if;
+        --manipulation of register wich indicates when the output becomes valid
+        if(m_ready = '1') then 
+          if(valid_out_reg < "11") then
+            valid_out_next <= std_logic_vector(unsigned(valid_out_reg) + 1); 
+          end if;
+          --check if the positions in bounds, if not the data is marked as invalid
+          if((a_q_s < 0) or (b_q_s < 0)) then
+            data_out_next <= INVALID_PIX_MASK;
+          else
+            data_out_next <= std_logic_vector("000000000000" & b_q_s & a_q_s);         
+          end if;
+          --manipulation with angle
+          if(theta_reg = full_circle) then
+            theta_next <= (others => '0');
+          else
+            theta_next <= std_logic_vector(unsigned(theta_reg) + 1);
+          end if; 
+          --state change after all buffers data has been processed or new data from bafers has been processed
+          if(theta_reg = "0000000001" and valid_out_reg = "11") then
+            if(address_reg = "0000") then
+              state_next <= mm2s;
+              theta_next <= (others => '0');
+              valid_out_next <= (others => '0');
+            else
+              address_next <= std_logic_vector(unsigned(address_reg) - 1);
+            end if;
+          end if;
+        end if; 
+        
+    end case;
+  end process sequential_logic;
+   
+  --combinational logic
+  r1_sin_res_s <= signed(radius_reg) * signed(sin_reg);
+  r2_cos_res_s <= signed(radius_reg) * signed(cos_reg);
+  
+  a_nq_s <= signed(std_logic_vector'("0000" & file_x_reg(to_integer(unsigned(address_reg))) & "000000")) - signed(r1_reg);
+  b_nq_s <= signed(std_logic_vector'("0000" & file_y_reg(to_integer(unsigned(address_reg))) & "000000")) - signed(r2_reg);
+  
+  m_data_out <= data_out_reg;
+  
+  --the process in which the results are quantized
+  quantization_process : process (a_nq_s, b_nq_s) is
+  begin  
+    if (a_nq_s(5) = '1') then
+      --the first digit behind the dot is 1
+      a_q_s <= a_nq_s(15 downto 6) + 1;
+    else
+      a_q_s <= a_nq_s(15 downto 6);
+    end if;
+
+    if (b_nq_s(5) = '1') then
+      --the first digit behind the dot is 1
+      b_q_s <= b_nq_s(15 downto 6) + 1;
+    else
+      b_q_s <= b_nq_s(15 downto 6);
+    end if;
+  end process quantization_process;
+  
+  -- process sine_samples
+  sine_samples : process (theta_reg) is
+  begin  
+    case theta_reg is
+      when "0000000000" =>              -- THETA = 0
+        sin_output_s <= "0000000000";
+      when "0000000001" =>
+        sin_output_s <= "0000000001";
+      when "0000000010" =>
+        sin_output_s <= "0000000010";
+      when "0000000011" =>
+        sin_output_s <= "0000000011";
+      when "0000000100" =>
+        sin_output_s <= "0000000100";
+      when "0000000101" =>
+        sin_output_s <= "0000000101";
+      when "0000000110" =>
+        sin_output_s <= "0000000110";
+      when "0000000111" =>
+        sin_output_s <= "0000000111";
+      when "0000001000" =>
+        sin_output_s <= "0000001000";
+      when "0000001001" =>
+        sin_output_s <= "0000001010";
+      when "0000001010" =>
+        sin_output_s <= "0000001011";
+      when "0000001011" =>
+        sin_output_s <= "0000001100";
+      when "0000001100" =>
+        sin_output_s <= "0000001101";
+      when "0000001101" =>
+        sin_output_s <= "0000001110";
+      when "0000001110" =>
+        sin_output_s <= "0000001111";
+      when "0000001111" =>
+        sin_output_s <= "0000010000";
+      when "0000010000" =>
+        sin_output_s <= "0000010001";
+      when "0000010001" =>
+        sin_output_s <= "0000010010";
+      when "0000010010" =>
+        sin_output_s <= "0000010011";
+      when "0000010011" =>
+        sin_output_s <= "0000010100";
+      when "0000010100" =>
+        sin_output_s <= "0000010101";
+      when "0000010101" =>
+        sin_output_s <= "0000010110";
+      when "0000010110" =>
+        sin_output_s <= "0000010111";
+      when "0000010111" =>
+        sin_output_s <= "0000011001";
+      when "0000011000" =>
+        sin_output_s <= "0000011010";
+      when "0000011001" =>
+        sin_output_s <= "0000011011";
+      when "0000011010" =>
+        sin_output_s <= "0000011100";
+      when "0000011011" =>
+        sin_output_s <= "0000011101";
+      when "0000011100" =>
+        sin_output_s <= "0000011110";
+      when "0000011101" =>
+        sin_output_s <= "0000011111";
+      when "0000011110" =>
+        sin_output_s <= "0000011111";
+      when "0000011111" =>
+        sin_output_s <= "0000100000";
+      when "0000100000" =>
+        sin_output_s <= "0000100001";
+      when "0000100001" =>
+        sin_output_s <= "0000100010";
+      when "0000100010" =>
+        sin_output_s <= "0000100011";
+      when "0000100011" =>
+        sin_output_s <= "0000100100";
+      when "0000100100" =>
+        sin_output_s <= "0000100101";
+      when "0000100101" =>
+        sin_output_s <= "0000100110";
+      when "0000100110" =>
+        sin_output_s <= "0000100111";
+      when "0000100111" =>
+        sin_output_s <= "0000101000";
+      when "0000101000" =>
+        sin_output_s <= "0000101001";
+      when "0000101001" =>
+        sin_output_s <= "0000101001";
+      when "0000101010" =>
+        sin_output_s <= "0000101010";
+      when "0000101011" =>
+        sin_output_s <= "0000101011";
+      when "0000101100" =>
+        sin_output_s <= "0000101100";
+      when "0000101101" =>
+        sin_output_s <= "0000101101";
+      when "0000101110" =>
+        sin_output_s <= "0000101110";
+      when "0000101111" =>
+        sin_output_s <= "0000101110";
+      when "0000110000" =>
+        sin_output_s <= "0000101111";
+      when "0000110001" =>
+        sin_output_s <= "0000110000";
+      when "0000110010" =>
+        sin_output_s <= "0000110001";
+      when "0000110011" =>
+        sin_output_s <= "0000110001";
+      when "0000110100" =>
+        sin_output_s <= "0000110010";
+      when "0000110101" =>
+        sin_output_s <= "0000110011";
+      when "0000110110" =>
+        sin_output_s <= "0000110011";
+      when "0000110111" =>
+        sin_output_s <= "0000110100";
+      when "0000111000" =>
+        sin_output_s <= "0000110101";
+      when "0000111001" =>
+        sin_output_s <= "0000110101";
+      when "0000111010" =>
+        sin_output_s <= "0000110110";
+      when "0000111011" =>
+        sin_output_s <= "0000110110";
+      when "0000111100" =>
+        sin_output_s <= "0000110111";
+      when "0000111101" =>
+        sin_output_s <= "0000110111";
+      when "0000111110" =>
+        sin_output_s <= "0000111000";
+      when "0000111111" =>
+        sin_output_s <= "0000111001";
+      when "0001000000" =>
+        sin_output_s <= "0000111001";
+      when "0001000001" =>
+        sin_output_s <= "0000111010";
+      when "0001000010" =>
+        sin_output_s <= "0000111010";
+      when "0001000011" =>
+        sin_output_s <= "0000111010";
+      when "0001000100" =>
+        sin_output_s <= "0000111011";
+      when "0001000101" =>
+        sin_output_s <= "0000111011";
+      when "0001000110" =>
+        sin_output_s <= "0000111100";
+      when "0001000111" =>
+        sin_output_s <= "0000111100";
+      when "0001001000" =>
+        sin_output_s <= "0000111100";
+      when "0001001001" =>
+        sin_output_s <= "0000111101";
+      when "0001001010" =>
+        sin_output_s <= "0000111101";
+      when "0001001011" =>
+        sin_output_s <= "0000111101";
+      when "0001001100" =>
+        sin_output_s <= "0000111110";
+      when "0001001101" =>
+        sin_output_s <= "0000111110";
+      when "0001001110" =>
+        sin_output_s <= "0000111110";
+      when "0001001111" =>
+        sin_output_s <= "0000111110";
+      when "0001010000" =>
+        sin_output_s <= "0000111111";
+      when "0001010001" =>
+        sin_output_s <= "0000111111";
+      when "0001010010" =>
+        sin_output_s <= "0000111111";
+      when "0001010011" =>
+        sin_output_s <= "0000111111";
+      when "0001010100" =>
+        sin_output_s <= "0000111111";
+      when "0001010101" =>
+        sin_output_s <= "0000111111";
+      when "0001010110" =>
+        sin_output_s <= "0000111111";
+      when "0001010111" =>
+        sin_output_s <= "0000111111";
+      when "0001011000" =>
+        sin_output_s <= "0000111111";
+      when "0001011001" =>
+        sin_output_s <= "0000111111";
+      when "0001011010" =>                  --THETA = 90
+        sin_output_s <= "0001000000"; 
+	  when "0001011011" => 	                --THETA = 91
+        sin_output_s <= "0000111111";
+      when "0001011100" =>
+        sin_output_s <= "0000111111";
+      when "0001011101" =>
+        sin_output_s <= "0000111111";
+      when "0001011110" =>
+        sin_output_s <= "0000111111";
+      when "0001011111" =>
+        sin_output_s <= "0000111111";
+      when "0001100000" =>
+        sin_output_s <= "0000111111";
+      when "0001100001" =>
+        sin_output_s <= "0000111111";
+      when "0001100010" =>
+        sin_output_s <= "0000111111";
+      when "0001100011" =>
+        sin_output_s <= "0000111111";
+      when "0001100100" =>
+        sin_output_s <= "0000111111";
+      when "0001100101" =>
+        sin_output_s <= "0000111110";
+      when "0001100110" =>
+        sin_output_s <= "0000111110";
+      when "0001100111" =>
+        sin_output_s <= "0000111110";
+      when "0001101000" =>
+        sin_output_s <= "0000111110";
+      when "0001101001" =>
+        sin_output_s <= "0000111101";
+      when "0001101010" =>
+        sin_output_s <= "0000111101";
+      when "0001101011" =>
+        sin_output_s <= "0000111101";
+	  when "0001101100" =>
+        sin_output_s <= "0000111100";
+      when "0001101101" =>
+        sin_output_s <= "0000111100";
+      when "0001101110" =>
+        sin_output_s <= "0000111100";
+	  when "0001101111" =>
+        sin_output_s <= "0000111011";
+      when "0001110000" =>
+        sin_output_s <= "0000111011";
+      when "0001110001" =>
+        sin_output_s <= "0000111010";
+      when "0001110010" =>
+        sin_output_s <= "0000111010";
+      when "0001110011" =>
+        sin_output_s <= "0000111010";
+	  when "0001110100" =>
+        sin_output_s <= "0000111001";
+      when "0001110101" =>
+        sin_output_s <= "0000111001";
+	  when "0001110110" =>
+        sin_output_s <= "0000111000";
+	  when "0001110111" =>
+        sin_output_s <= "0000110111";
+      when "0001111000" =>
+        sin_output_s <= "0000110111";
+      when "0001111001" =>
+        sin_output_s <= "0000110110";
+      when "0001111010" =>
+        sin_output_s <= "0000110110";
+	  when "0001111011" =>
+        sin_output_s <= "0000110101";
+      when "0001111100" =>
+        sin_output_s <= "0000110101";
+	  when "0001111101" =>
+        sin_output_s <= "0000110100";
+	  when "0001111110" =>
+        sin_output_s <= "0000110011";
+      when "0001111111" =>
+        sin_output_s <= "0000110011";
+	  when "0010000000" =>
+        sin_output_s <= "0000110010";
+	  when "0010000001" =>
+        sin_output_s <= "0000110001";
+      when "0010000010" =>
+        sin_output_s <= "0000110001";
+	  when "0010000011" =>
+        sin_output_s <= "0000110000";
+	  when "0010000100" =>
+        sin_output_s <= "0000101111";
+	  when "0010000101" =>
+        sin_output_s <= "0000101110";
+      when "0010000110" =>
+        sin_output_s <= "0000101110";
+	  when "0010000111" =>
+        sin_output_s <= "0000101101";
+	  when "0010001000" =>
+        sin_output_s <= "0000101100";
+	  when "0010001001" =>
+        sin_output_s <= "0000101011";
+	  when "0010001010" =>
+        sin_output_s <= "0000101010";
+      when "0010001011" =>
+        sin_output_s <= "0000101001";
+      when "0010001100" =>
+        sin_output_s <= "0000101001";
+	  when "0010001101" =>
+        sin_output_s <= "0000101000";
+	  when "0010001110" =>
+        sin_output_s <= "0000100111";
+	  when "0010001111" =>
+        sin_output_s <= "0000100110";
+	  when "0010010000" =>
+        sin_output_s <= "0000100101";
+	  when "0010010001" =>
+        sin_output_s <= "0000100100";
+	  when "0010010010" =>
+        sin_output_s <= "0000100011";
+	  when "0010010011" =>
+        sin_output_s <= "0000100010";
+	  when "0010010100" =>
+        sin_output_s <= "0000100001";
+	  when "0010010101" =>
+        sin_output_s <= "0000100000";
+	  when "0010010110" =>
+        sin_output_s <= "0000011111";
+      when "0010010111" =>
+        sin_output_s <= "0000011111";
+	  when "0010011000" =>
+        sin_output_s <= "0000011110";
+	  when "0010011001" =>
+        sin_output_s <= "0000011101";
+	  when "0010011010" =>
+        sin_output_s <= "0000011100";
+	  when "0010011011" =>
+        sin_output_s <= "0000011011";
+	  when "0010011100" =>
+        sin_output_s <= "0000011010";
+	  when "0010011101" =>
+        sin_output_s <= "0000011001";
+	  when "0010011110" =>
+        sin_output_s <= "0000010111";
+	  when "0010011111" =>
+        sin_output_s <= "0000010110";
+	  when "0010100000" =>
+        sin_output_s <= "0000010101";
+	  when "0010100001" =>
+        sin_output_s <= "0000010100";
+	  when "0010100010" =>
+        sin_output_s <= "0000010011";
+	  when "0010100011" =>
+        sin_output_s <= "0000010010";
+	  when "0010100100" =>
+        sin_output_s <= "0000010001";
+	  when "0010100101" =>
+        sin_output_s <= "0000010000";
+	  when "0010100110" =>
+        sin_output_s <= "0000001111";
+	  when "0010100111" =>
+        sin_output_s <= "0000001110";
+	  when "0010101000" =>
+        sin_output_s <= "0000001101";
+	  when "0010101001" =>
+        sin_output_s <= "0000001100";
+	  when "0010101010" =>
+        sin_output_s <= "0000001011";
+	  when "0010101011" =>
+        sin_output_s <= "0000001010";
+	  when "0010101100" =>
+        sin_output_s <= "0000001000";
+	  when "0010101101" =>
+        sin_output_s <= "0000000111";
+	  when "0010101110" =>
+        sin_output_s <= "0000000110";
+	  when "0010101111" =>
+        sin_output_s <= "0000000101";
+	  when "0010110000" =>
+        sin_output_s <= "0000000100";
+	  when "0010110001" =>
+        sin_output_s <= "0000000011";
+	  when "0010110010" =>
+        sin_output_s <= "0000000010";
+	  when "0010110011" =>
+        sin_output_s <= "0000000001";
+	  when "0010110100" =>                      -- THETA = 180
+        sin_output_s <= "0000000000"; 
+      when "0010110101" =>                      -- THETA = 181
+        sin_output_s <= -"0000000001";
+      when "0010110110" =>
+        sin_output_s <= -"0000000010";
+      when "0010110111" =>
+        sin_output_s <= -"0000000011";
+      when "0010111000" =>
+        sin_output_s <= -"0000000100";
+      when "0010111001" =>
+        sin_output_s <= -"0000000101";
+      when "0010111010" =>
+        sin_output_s <= -"0000000110";
+      when "0010111011" =>
+        sin_output_s <= -"0000000111";
+      when "0010111100" =>
+        sin_output_s <= -"0000001000";
+      when "0010111101" =>
+        sin_output_s <= -"0000001010";
+      when "0010111110" =>
+        sin_output_s <= -"0000001011";
+      when "0010111111" =>
+        sin_output_s <= -"0000001100";
+      when "0011000000" =>
+        sin_output_s <= -"0000001101";
+      when "0011000001" =>
+        sin_output_s <= -"0000001110";
+      when "0011000010" =>
+        sin_output_s <= -"0000001111";
+      when "0011000011" =>
+        sin_output_s <= -"0000010000";
+      when "0011000100" =>
+        sin_output_s <= -"0000010001";
+      when "0011000101" =>
+        sin_output_s <= -"0000010010";
+      when "0011000110" =>
+        sin_output_s <= -"0000010011";
+      when "0011000111" =>
+        sin_output_s <= -"0000010100";
+      when "0011001000" =>
+        sin_output_s <= -"0000010101";
+      when "0011001001" =>
+        sin_output_s <= -"0000010110";
+      when "0011001010" =>
+        sin_output_s <= -"0000010111";
+      when "0011001011" =>
+        sin_output_s <= -"0000011001";
+      when "0011001100" =>
+        sin_output_s <= -"0000011010";
+      when "0011001101" =>
+        sin_output_s <= -"0000011011";
+      when "0011001110" =>
+        sin_output_s <= -"0000011100";
+      when "0011001111" =>
+        sin_output_s <= -"0000011101";
+      when "0011010000" =>
+        sin_output_s <= -"0000011110";
+      when "0011010001" =>
+        sin_output_s <= -"0000011111";
+      when "0011010010" =>
+        sin_output_s <= -"0000011111";
+      when "0011010011" =>
+        sin_output_s <= -"0000100000";
+      when "0011010100" =>
+        sin_output_s <= -"0000100001";
+      when "0011010101" =>
+        sin_output_s <= -"0000100010";
+      when "0011010110" =>
+        sin_output_s <= -"0000100011";
+      when "0011010111" =>
+        sin_output_s <= -"0000100100";
+      when "0011011000" =>
+        sin_output_s <= -"0000100101";
+      when "0011011001" =>
+        sin_output_s <= -"0000100110";
+      when "0011011010" =>
+        sin_output_s <= -"0000100111";
+      when "0011011011" =>
+        sin_output_s <= -"0000101000";
+      when "0011011100" =>
+        sin_output_s <= -"0000101001";
+      when "0011011101" =>
+        sin_output_s <= -"0000101001";
+      when "0011011110" =>
+        sin_output_s <= -"0000101010";
+      when "0011011111" =>
+        sin_output_s <= -"0000101011";
+      when "0011100000" =>
+        sin_output_s <= -"0000101100";
+      when "0011100001" =>
+        sin_output_s <= -"0000101101";
+      when "0011100010" =>
+        sin_output_s <= -"0000101110";
+      when "0011100011" =>
+        sin_output_s <= -"0000101110";
+      when "0011100100" =>
+        sin_output_s <= -"0000101111";
+      when "0011100101" =>
+        sin_output_s <= -"0000110000";
+      when "0011100110" =>
+        sin_output_s <= -"0000110001";
+      when "0011100111" =>
+        sin_output_s <= -"0000110001";
+      when "0011101000" =>
+        sin_output_s <= -"0000110010";
+      when "0011101001" =>
+        sin_output_s <= -"0000110011";
+      when "0011101010" =>
+        sin_output_s <= -"0000110011";
+      when "0011101011" =>
+        sin_output_s <= -"0000110100";
+      when "0011101100" =>
+        sin_output_s <= -"0000110101";
+      when "0011101101" =>
+        sin_output_s <= -"0000110101";
+      when "0011101110" =>
+        sin_output_s <= -"0000110110";
+      when "0011101111" =>
+        sin_output_s <= -"0000110110";
+      when "0011110000" =>
+        sin_output_s <= -"0000110111";
+      when "0011110001" =>
+        sin_output_s <= -"0000110111";
+      when "0011110010" =>
+        sin_output_s <= -"0000111000";
+      when "0011110011" =>
+        sin_output_s <= -"0000111001";
+      when "0011110100" =>
+        sin_output_s <= -"0000111001";
+      when "0011110101" =>
+        sin_output_s <= -"0000111010";
+      when "0011110110" =>
+        sin_output_s <= -"0000111010";
+      when "0011110111" =>
+        sin_output_s <= -"0000111010";
+      when "0011111000" =>
+        sin_output_s <= -"0000111011";
+      when "0011111001" =>
+        sin_output_s <= -"0000111011";
+      when "0011111010" =>
+        sin_output_s <= -"0000111100";
+      when "0011111011" =>
+        sin_output_s <= -"0000111100";
+      when "0011111100" =>
+        sin_output_s <= -"0000111100";
+      when "0011111101" =>
+        sin_output_s <= -"0000111101";
+      when "0011111110" =>
+        sin_output_s <= -"0000111101";
+      when "0011111111" =>
+        sin_output_s <= -"0000111101";
+      when "0100000000" =>
+        sin_output_s <= -"0000111110";
+      when "0100000001" =>
+        sin_output_s <= -"0000111110";
+      when "0100000010" =>
+        sin_output_s <= -"0000111110";
+      when "0100000011" =>
+        sin_output_s <= -"0000111110";
+      when "0100000100" =>
+        sin_output_s <= -"0000111111";
+      when "0100000101" =>
+        sin_output_s <= -"0000111111";
+      when "0100000110" =>
+        sin_output_s <= -"0000111111";
+      when "0100000111" =>
+        sin_output_s <= -"0000111111";
+      when "0100001000" =>
+        sin_output_s <= -"0000111111";
+      when "0100001001" =>
+        sin_output_s <= -"0000111111";
+      when "0100001010" =>
+        sin_output_s <= -"0000111111";
+      when "0100001011" =>
+        sin_output_s <= -"0000111111";
+      when "0100001100" =>
+        sin_output_s <= -"0000111111";
+      when "0100001101" =>
+        sin_output_s <= -"0000111111";
+      when "0100001110" =>                -- THETA = 270
+        sin_output_s <= -"0001000000";
+	  when "0100001111" =>                -- THETA = 271
+        sin_output_s <= -"0000111111";
+      when "0100010000" =>
+        sin_output_s <= -"0000111111";
+      when "0100010001" =>
+        sin_output_s <= -"0000111111";
+      when "0100010010" =>
+        sin_output_s <= -"0000111111";
+      when "0100010011" =>
+        sin_output_s <= -"0000111111";
+      when "0100010100" =>
+        sin_output_s <= -"0000111111";
+      when "0100010101" =>
+        sin_output_s <= -"0000111111";
+      when "0100010110" =>
+        sin_output_s <= -"0000111111";
+      when "0100010111" => 
+        sin_output_s <= -"0000111111";
+      when "0100011000" =>
+        sin_output_s <= -"0000111111";
+      when "0100011001" =>
+        sin_output_s <= -"0000111110";
+      when "0100011010" =>
+        sin_output_s <= -"0000111110";
+      when "0100011011" =>
+        sin_output_s <= -"0000111110";
+      when "0100011100" =>
+        sin_output_s <= -"0000111110";
+      when "0100011101" =>
+        sin_output_s <= -"0000111101";
+      when "0100011110" =>
+        sin_output_s <= -"0000111101";
+      when "0100011111" =>
+        sin_output_s <= -"0000111101";
+	  when "0100100000" =>
+        sin_output_s <= -"0000111100";
+      when "0100100001" =>
+        sin_output_s <= -"0000111100";
+      when "0100100010" =>
+        sin_output_s <= -"0000111100";
+	  when "0100100011" =>
+        sin_output_s <= -"0000111011";
+      when "0100100100" =>
+        sin_output_s <= -"0000111011";
+      when "0100100101" =>
+        sin_output_s <= -"0000111010";
+      when "0100100110" =>
+        sin_output_s <= -"0000111010";
+      when "0100100111" =>
+        sin_output_s <= -"0000111010";
+	  when "0100101000" =>
+        sin_output_s <= -"0000111001";
+      when "0100101001" =>
+        sin_output_s <= -"0000111001";
+	  when "0100101010" =>
+        sin_output_s <= -"0000111000";
+	  when "0100101011" =>
+        sin_output_s <= -"0000110111";
+      when "0100101100" =>
+        sin_output_s <= -"0000110111";
+      when "0100101101" =>
+        sin_output_s <= -"0000110110";
+      when "0100101110" =>
+        sin_output_s <= -"0000110110";
+	  when "0100101111" =>
+        sin_output_s <= -"0000110101";
+      when "0100110000" =>
+        sin_output_s <= -"0000110101";
+	  when "0100110001" =>
+        sin_output_s <= -"0000110100";
+	  when "0100110010" =>
+        sin_output_s <= -"0000110011";
+      when "0100110011" =>
+        sin_output_s <= -"0000110011";
+	  when "0100110100" =>
+        sin_output_s <= -"0000110010";
+	  when "0100110101" =>
+        sin_output_s <= -"0000110001";
+      when "0100110110" =>
+        sin_output_s <= -"0000110001";
+	  when "0100110111" =>
+        sin_output_s <= -"0000110000";
+	  when "0100111000" =>
+        sin_output_s <= -"0000101111";
+	  when "0100111001" =>
+        sin_output_s <= -"0000101110";
+      when "0100111010" =>
+        sin_output_s <= -"0000101110";
+	  when "0100111011" =>
+        sin_output_s <= -"0000101101";
+	  when "0100111100" =>
+        sin_output_s <= -"0000101100";
+	  when "0100111101" =>
+        sin_output_s <= -"0000101011";
+	  when "0100111110" =>
+        sin_output_s <= -"0000101010";
+      when "0100111111" =>
+        sin_output_s <= -"0000101001";
+      when "0101000000" =>
+        sin_output_s <= -"0000101001";
+	  when "0101000001" =>
+        sin_output_s <= -"0000101000";
+	  when "0101000010" =>
+        sin_output_s <= -"0000100111";
+	  when "0101000011" =>
+        sin_output_s <= -"0000100110";
+	  when "0101000100" =>
+        sin_output_s <= -"0000100101";
+	  when "0101000101" =>
+        sin_output_s <= -"0000100100";
+	  when "0101000110" =>
+        sin_output_s <= -"0000100011";
+	  when "0101000111" =>
+        sin_output_s <= -"0000100010";
+	  when "0101001000" =>
+        sin_output_s <= -"0000100001";
+	  when "0101001001" =>
+        sin_output_s <= -"0000100000";
+	  when "0101001010" =>
+        sin_output_s <= -"0000011111";
+      when "0101001011" =>
+        sin_output_s <= -"0000011111";
+	  when "0101001100" =>
+        sin_output_s <= -"0000011110";
+	  when "0101001101" =>
+        sin_output_s <= -"0000011101";
+	  when "0101001110" =>
+        sin_output_s <= -"0000011100";
+	  when "0101001111" =>
+        sin_output_s <= -"0000011011";
+	  when "0101010000" =>
+        sin_output_s <= -"0000011010";
+	  when "0101010001" =>
+        sin_output_s <= -"0000011001";
+	  when "0101010010" =>
+        sin_output_s <= -"0000010111";
+	  when "0101010011" =>
+        sin_output_s <= -"0000010110";
+	  when "0101010100" =>
+        sin_output_s <= -"0000010101";
+	  when "0101010101" =>
+        sin_output_s <= -"0000010100";
+	  when "0101010110" =>
+        sin_output_s <= -"0000010011";
+	  when "0101010111" =>
+        sin_output_s <= -"0000010010";
+	  when "0101011000" =>
+        sin_output_s <= -"0000010001";
+	  when "0101011001" =>
+        sin_output_s <= -"0000010000";
+	  when "0101011010" =>
+        sin_output_s <= -"0000001111";
+	  when "0101011011" =>
+        sin_output_s <= -"0000001110";
+	  when "0101011100" =>
+        sin_output_s <= -"0000001101";
+	  when "0101011101" =>
+        sin_output_s <= -"0000001100";
+	  when "0101011110" =>
+        sin_output_s <= -"0000001011";
+	  when "0101011111" =>
+        sin_output_s <= -"0000001010";
+	  when "0101100000" =>
+        sin_output_s <= -"0000001000";
+	  when "0101100001" =>
+        sin_output_s <= -"0000000111";
+	  when "0101100010" =>
+        sin_output_s <= -"0000000110";
+	  when "0101100011" =>
+        sin_output_s <= -"0000000101";
+	  when "0101100100" =>
+        sin_output_s <= -"0000000100";
+	  when "0101100101" =>
+        sin_output_s <= -"0000000011";
+	  when "0101100110" =>
+        sin_output_s <= -"0000000010";
+	  when "0101100111" =>
+        sin_output_s <= -"0000000001";
+	  when "0101101000" =>           -- THETA = 360
+        sin_output_s <= "0000000000";
+      when others =>
+        sin_output_s <= (others => '1');
+    end case;
+  end process sine_samples;
+  
+  -- process cosine_samples
+  cosine_samples : process (theta_reg) is
+  begin  
+    case theta_reg is	  
+	  when "0000000000" =>              -- THETA = 0
+        cos_output_s <= "0001000000";
+      when "0000000001" =>
+        cos_output_s <= "0000111111";
+      when "0000000010" =>
+        cos_output_s <= "0000111111";
+      when "0000000011" =>
+        cos_output_s <= "0000111111";
+      when "0000000100" =>
+        cos_output_s <= "0000111111";
+      when "0000000101" =>
+        cos_output_s <= "0000111111";
+      when "0000000110" =>
+        cos_output_s <= "0000111111";
+      when "0000000111" =>
+        cos_output_s <= "0000111111";
+      when "0000001000" =>
+        cos_output_s <= "0000111111";
+      when "0000001001" =>
+        cos_output_s <= "0000111111";
+      when "0000001010" =>
+        cos_output_s <= "0000111111";
+      when "0000001011" =>
+        cos_output_s <= "0000111110";
+      when "0000001100" =>
+        cos_output_s <= "0000111110";
+      when "0000001101" =>
+        cos_output_s <= "0000111110";
+      when "0000001110" =>
+        cos_output_s <= "0000111110";
+      when "0000001111" =>
+        cos_output_s <= "0000111101";
+      when "0000010000" =>
+        cos_output_s <= "0000111101";
+      when "0000010001" =>
+        cos_output_s <= "0000111101";
+      when "0000010010" =>
+        cos_output_s <= "0000111100";
+      when "0000010011" =>
+        cos_output_s <= "0000111100";
+      when "0000010100" =>
+        cos_output_s <= "0000111100";
+      when "0000010101" =>
+        cos_output_s <= "0000111011";
+      when "0000010110" =>
+        cos_output_s <= "0000111011";
+      when "0000010111" =>
+        cos_output_s <= "0000111010";
+      when "0000011000" =>
+        cos_output_s <= "0000111010";
+      when "0000011001" =>
+        cos_output_s <= "0000111010";
+      when "0000011010" =>
+        cos_output_s <= "0000111001";
+      when "0000011011" =>
+        cos_output_s <= "0000111001";
+      when "0000011100" =>
+        cos_output_s <= "0000111000";
+      when "0000011101" =>
+        cos_output_s <= "0000110111";
+      when "0000011110" =>
+        cos_output_s <= "0000110111";
+      when "0000011111" =>
+        cos_output_s <= "0000110110";
+      when "0000100000" =>
+        cos_output_s <= "0000110110";
+      when "0000100001" =>
+        cos_output_s <= "0000110101";
+      when "0000100010" =>
+        cos_output_s <= "0000110101";
+      when "0000100011" =>
+        cos_output_s <= "0000110100";
+      when "0000100100" =>
+        cos_output_s <= "0000110011";
+      when "0000100101" =>
+        cos_output_s <= "0000110011";
+      when "0000100110" =>
+        cos_output_s <= "0000110010";
+      when "0000100111" =>
+        cos_output_s <= "0000110001";
+      when "0000101000" =>
+        cos_output_s <= "0000110001";
+      when "0000101001" =>
+        cos_output_s <= "0000110000";
+      when "0000101010" =>
+        cos_output_s <= "0000101111";
+      when "0000101011" =>
+        cos_output_s <= "0000101110";
+      when "0000101100" =>
+        cos_output_s <= "0000101110";
+      when "0000101101" =>
+        cos_output_s <= "0000101101";
+      when "0000101110" =>
+        cos_output_s <= "0000101100";
+      when "0000101111" =>
+        cos_output_s <= "0000101011";
+      when "0000110000" =>
+        cos_output_s <= "0000101010";
+      when "0000110001" =>
+        cos_output_s <= "0000101001";
+      when "0000110010" =>
+        cos_output_s <= "0000101001";
+      when "0000110011" =>
+        cos_output_s <= "0000101000";
+      when "0000110100" =>
+        cos_output_s <= "0000100111";
+      when "0000110101" =>
+        cos_output_s <= "0000100110";
+      when "0000110110" =>
+        cos_output_s <= "0000100101";
+      when "0000110111" =>
+        cos_output_s <= "0000100100";
+      when "0000111000" =>
+        cos_output_s <= "0000100011";
+      when "0000111001" =>
+        cos_output_s <= "0000100010";
+      when "0000111010" =>
+        cos_output_s <= "0000100001";
+      when "0000111011" =>
+        cos_output_s <= "0000100000";
+      when "0000111100" =>
+        cos_output_s <= "0000011111";
+      when "0000111101" =>
+        cos_output_s <= "0000011111";
+      when "0000111110" =>
+        cos_output_s <= "0000011110";
+      when "0000111111" =>
+        cos_output_s <= "0000011101";
+      when "0001000000" =>
+        cos_output_s <= "0000011100";
+      when "0001000001" =>
+        cos_output_s <= "0000011011";
+      when "0001000010" =>
+        cos_output_s <= "0000011010";
+      when "0001000011" =>
+        cos_output_s <= "0000011001";
+      when "0001000100" =>
+        cos_output_s <= "0000010111";
+      when "0001000101" =>
+        cos_output_s <= "0000010110";
+      when "0001000110" =>
+        cos_output_s <= "0000010101";
+      when "0001000111" =>
+        cos_output_s <= "0000010100";
+      when "0001001000" =>
+        cos_output_s <= "0000010011";
+      when "0001001001" =>
+        cos_output_s <= "0000010010";
+      when "0001001010" =>
+        cos_output_s <= "0000010001";
+      when "0001001011" =>
+        cos_output_s <= "0000010000";
+      when "0001001100" =>
+        cos_output_s <= "0000001111";
+      when "0001001101" =>
+        cos_output_s <= "0000001110";
+      when "0001001110" =>
+        cos_output_s <= "0000001101";
+      when "0001001111" =>
+        cos_output_s <= "0000001100";
+      when "0001010000" =>
+        cos_output_s <= "0000001011";
+      when "0001010001" =>
+        cos_output_s <= "0000001010";
+      when "0001010010" =>
+        cos_output_s <= "0000001000";
+      when "0001010011" =>
+        cos_output_s <= "0000000111";
+      when "0001010100" =>
+        cos_output_s <= "0000000110";
+      when "0001010101" =>
+        cos_output_s <= "0000000101";
+      when "0001010110" =>
+        cos_output_s <= "0000000100";
+      when "0001010111" =>
+        cos_output_s <= "0000000011";
+      when "0001011000" =>
+        cos_output_s <= "0000000010";
+      when "0001011001" =>
+        cos_output_s <= "0000000001";
+      when "0001011010" =>                         --THETA = 90
+        cos_output_s <= "0000000000";
+	  when "0001011011" => 						   --THETA = 91
+        cos_output_s <= -"0000000001";
+      when "0001011100" =>
+        cos_output_s <= -"0000000010";
+      when "0001011101" =>
+        cos_output_s <= -"0000000011";
+      when "0001011110" =>
+        cos_output_s <= -"0000000100";
+      when "0001011111" =>
+        cos_output_s <= -"0000000101";
+      when "0001100000" =>
+        cos_output_s <= -"0000000110";
+      when "0001100001" =>
+        cos_output_s <= -"0000000111";
+      when "0001100010" =>
+        cos_output_s <= -"0000001000";
+      when "0001100011" =>
+        cos_output_s <= -"0000001010";
+      when "0001100100" =>
+        cos_output_s <= -"0000001011";
+      when "0001100101" =>
+        cos_output_s <= -"0000001100";
+      when "0001100110" =>
+        cos_output_s <= -"0000001101";
+      when "0001100111" =>
+        cos_output_s <= -"0000001110";
+      when "0001101000" =>
+        cos_output_s <= -"0000001111";
+      when "0001101001" =>
+        cos_output_s <= -"0000010000";
+      when "0001101010" =>
+        cos_output_s <= -"0000010001";
+      when "0001101011" =>
+        cos_output_s <= -"0000010010";
+	  when "0001101100" =>
+        cos_output_s <= -"0000010011";
+      when "0001101101" =>
+        cos_output_s <= -"0000010100";
+      when "0001101110" =>
+        cos_output_s <= -"0000010101";
+	  when "0001101111" =>
+        cos_output_s <= -"0000010110";
+      when "0001110000" =>
+        cos_output_s <= -"0000010111";
+      when "0001110001" =>
+        cos_output_s <= -"0000011001";
+      when "0001110010" =>
+        cos_output_s <= -"0000011010";
+      when "0001110011" =>
+        cos_output_s <= -"0000011011";
+	  when "0001110100" =>
+        cos_output_s <= -"0000011100";
+      when "0001110101" =>
+        cos_output_s <= -"0000011101";
+	  when "0001110110" =>
+        cos_output_s <= -"0000011110";
+	  when "0001110111" =>
+        cos_output_s <= -"0000011111";
+      when "0001111000" =>
+        cos_output_s <= -"0000011111";
+      when "0001111001" =>
+        cos_output_s <= -"0000100000";
+      when "0001111010" =>
+        cos_output_s <= -"0000100001";
+	  when "0001111011" =>
+        cos_output_s <= -"0000100010";
+      when "0001111100" =>
+        cos_output_s <= -"0000100011";
+	  when "0001111101" =>
+        cos_output_s <= -"0000100100";
+	  when "0001111110" =>
+        cos_output_s <= -"0000100101";
+      when "0001111111" =>
+        cos_output_s <= -"0000100110";
+	  when "0010000000" =>
+        cos_output_s <= -"0000100111";
+	  when "0010000001" =>
+        cos_output_s <= -"0000101000";
+      when "0010000010" =>
+        cos_output_s <= -"0000101001";
+	  when "0010000011" =>
+        cos_output_s <= -"0000101001";
+	  when "0010000100" =>
+        cos_output_s <= -"0000101010";
+	  when "0010000101" =>
+        cos_output_s <= -"0000101011";
+      when "0010000110" =>
+        cos_output_s <= -"0000101100";
+	  when "0010000111" =>
+        cos_output_s <= -"0000101101";
+	  when "0010001000" =>
+        cos_output_s <= -"0000101110";
+	  when "0010001001" =>
+        cos_output_s <= -"0000101110";
+	  when "0010001010" =>
+        cos_output_s <= -"0000101111";
+      when "0010001011" =>
+        cos_output_s <= -"0000110000";
+      when "0010001100" =>
+        cos_output_s <= -"0000110001";
+	  when "0010001101" =>
+        cos_output_s <= -"0000110001";
+	  when "0010001110" =>
+        cos_output_s <= -"0000110010";
+	  when "0010001111" =>
+        cos_output_s <= -"0000110011";
+	  when "0010010000" =>
+        cos_output_s <= -"0000110011";
+	  when "0010010001" =>
+        cos_output_s <= -"0000110100";
+	  when "0010010010" =>
+        cos_output_s <= -"0000110101";
+	  when "0010010011" =>
+        cos_output_s <= -"0000110101";
+	  when "0010010100" =>
+        cos_output_s <= -"0000110110";
+	  when "0010010101" =>
+        cos_output_s <= -"0000110110";
+	  when "0010010110" =>
+        cos_output_s <= -"0000110111";
+      when "0010010111" =>
+        cos_output_s <= -"0000110111";
+	  when "0010011000" =>
+        cos_output_s <= -"0000111000";
+	  when "0010011001" =>
+        cos_output_s <= -"0000111001";
+	  when "0010011010" =>
+        cos_output_s <= -"0000111001";
+	  when "0010011011" =>
+        cos_output_s <= -"0000111010";
+	  when "0010011100" =>
+        cos_output_s <= -"0000111010";
+	  when "0010011101" =>
+        cos_output_s <= -"0000111010";
+	  when "0010011110" =>
+        cos_output_s <= -"0000111011";
+	  when "0010011111" =>
+        cos_output_s <= -"0000111011";
+	  when "0010100000" =>
+        cos_output_s <= -"0000111100";
+	  when "0010100001" =>
+        cos_output_s <= -"0000111100";
+	  when "0010100010" =>
+        cos_output_s <= -"0000111100";
+	  when "0010100011" =>
+        cos_output_s <= -"0000111101";
+	  when "0010100100" =>
+        cos_output_s <= -"0000111101";
+	  when "0010100101" =>
+        cos_output_s <= -"0000111101";
+	  when "0010100110" =>
+        cos_output_s <= -"0000111110";
+	  when "0010100111" =>
+        cos_output_s <= -"0000111110";
+	  when "0010101000" =>
+        cos_output_s <= -"0000111110";
+	  when "0010101001" =>
+        cos_output_s <= -"0000111110";
+	  when "0010101010" =>
+        cos_output_s <= -"0000111111";
+	  when "0010101011" =>
+        cos_output_s <= -"0000111111";
+	  when "0010101100" =>
+        cos_output_s <= -"0000111111";
+	  when "0010101101" =>
+        cos_output_s <= -"0000111111";
+	  when "0010101110" =>
+        cos_output_s <= -"0000111111";
+	  when "0010101111" =>
+        cos_output_s <= -"0000111111";
+	  when "0010110000" =>
+        cos_output_s <= -"0000111111";
+	  when "0010110001" =>
+        cos_output_s <= -"0000111111";
+	  when "0010110010" =>
+        cos_output_s <= -"0000111111";
+	  when "0010110011" =>
+        cos_output_s <= -"0000111111";
+	  when "0010110100" =>                     --  THETA = 180
+        cos_output_s <= -"0001000000";
+	  when "0010110101" =>                     -- THETA = 181
+        cos_output_s <= -"0000111111";
+      when "0010110110" =>
+        cos_output_s <= -"0000111111";
+      when "0010110111" =>
+        cos_output_s <= -"0000111111";
+      when "0010111000" =>
+        cos_output_s <= -"0000111111";
+      when "0010111001" =>
+        cos_output_s <= -"0000111111";
+      when "0010111010" =>
+        cos_output_s <= -"0000111111";
+      when "0010111011" =>
+        cos_output_s <= -"0000111111";
+      when "0010111100" =>
+        cos_output_s <= -"0000111111";
+      when "0010111101" =>
+        cos_output_s <= -"0000111111";
+      when "0010111110" =>
+        cos_output_s <= -"0000111111";
+      when "0010111111" =>
+        cos_output_s <= -"0000111110";
+      when "0011000000" =>
+        cos_output_s <= -"0000111110";
+      when "0011000001" =>
+        cos_output_s <= -"0000111110";
+      when "0011000010" =>
+        cos_output_s <= -"0000111110";
+      when "0011000011" =>
+        cos_output_s <= -"0000111101";
+      when "0011000100" =>
+        cos_output_s <= -"0000111101";
+      when "0011000101" =>
+        cos_output_s <= -"0000111101";
+      when "0011000110" =>
+        cos_output_s <= -"0000111100";
+      when "0011000111" =>
+        cos_output_s <= -"0000111100";
+      when "0011001000" =>
+        cos_output_s <= -"0000111100";
+      when "0011001001" =>
+        cos_output_s <= -"0000111011";
+      when "0011001010" =>
+        cos_output_s <= -"0000111011";
+      when "0011001011" =>
+        cos_output_s <= -"0000111010";
+      when "0011001100" =>
+        cos_output_s <= -"0000111010";
+      when "0011001101" =>
+        cos_output_s <= -"0000111010";
+      when "0011001110" =>
+        cos_output_s <= -"0000111001";
+      when "0011001111" =>
+        cos_output_s <= -"0000111001";
+      when "0011010000" =>
+        cos_output_s <= -"0000111000";
+      when "0011010001" =>
+        cos_output_s <= -"0000110111";
+      when "0011010010" =>
+        cos_output_s <= -"0000110111";
+      when "0011010011" =>
+        cos_output_s <= -"0000110110";
+      when "0011010100" =>
+        cos_output_s <= -"0000110110";
+      when "0011010101" =>
+        cos_output_s <= -"0000110101";
+      when "0011010110" =>
+        cos_output_s <= -"0000110101";
+      when "0011010111" =>
+        cos_output_s <= -"0000110100";
+      when "0011011000" =>
+        cos_output_s <= -"0000110011";
+      when "0011011001" =>
+        cos_output_s <= -"0000110011";
+      when "0011011010" =>
+        cos_output_s <= -"0000110010";
+      when "0011011011" =>
+        cos_output_s <= -"0000110001";
+      when "0011011100" =>
+        cos_output_s <= -"0000110001";
+      when "0011011101" =>
+        cos_output_s <= -"0000110000";
+      when "0011011110" =>
+        cos_output_s <= -"0000101111";
+      when "0011011111" =>
+        cos_output_s <= -"0000101110";
+      when "0011100000" =>
+        cos_output_s <= -"0000101110";
+      when "0011100001" =>
+        cos_output_s <= -"0000101101";
+      when "0011100010" =>
+        cos_output_s <= -"0000101100";
+      when "0011100011" =>
+        cos_output_s <= -"0000101011";
+      when "0011100100" =>
+        cos_output_s <= -"0000101010";
+      when "0011100101" =>
+        cos_output_s <= -"0000101001";
+      when "0011100110" =>
+        cos_output_s <= -"0000101001";
+      when "0011100111" =>
+        cos_output_s <= -"0000101000";
+      when "0011101000" =>
+        cos_output_s <= -"0000100111";
+      when "0011101001" =>
+        cos_output_s <= -"0000100110";
+      when "0011101010" =>
+        cos_output_s <= -"0000100101";
+      when "0011101011" =>
+        cos_output_s <= -"0000100100";
+      when "0011101100" =>
+        cos_output_s <= -"0000100011";
+      when "0011101101" =>
+        cos_output_s <= -"0000100010";
+      when "0011101110" =>
+        cos_output_s <= -"0000100001";
+      when "0011101111" =>
+        cos_output_s <= -"0000100000";
+      when "0011110000" =>
+        cos_output_s <= -"0000011111";
+      when "0011110001" =>
+        cos_output_s <= -"0000011111";
+      when "0011110010" =>
+        cos_output_s <= -"0000011110";
+      when "0011110011" =>
+        cos_output_s <= -"0000011101";
+      when "0011110100" =>
+        cos_output_s <= -"0000011100";
+      when "0011110101" =>
+        cos_output_s <= -"0000011011";
+      when "0011110110" =>
+        cos_output_s <= -"0000011010";
+      when "0011110111" =>
+        cos_output_s <= -"0000011001";
+      when "0011111000" =>
+        cos_output_s <= -"0000010111";
+      when "0011111001" =>
+        cos_output_s <= -"0000010110";
+      when "0011111010" =>
+        cos_output_s <= -"0000010101";
+      when "0011111011" =>
+        cos_output_s <= -"0000010100";
+      when "0011111100" =>
+        cos_output_s <= -"0000010011";
+      when "0011111101" =>
+        cos_output_s <= -"0000010010";
+      when "0011111110" =>
+        cos_output_s <= -"0000010001";
+      when "0011111111" =>
+        cos_output_s <= -"0000010000";
+      when "0100000000" =>
+        cos_output_s <= -"0000001111";
+      when "0100000001" =>
+        cos_output_s <= -"0000001110";
+      when "0100000010" =>
+        cos_output_s <= -"0000001101";
+      when "0100000011" =>
+        cos_output_s <= -"0000001100";
+      when "0100000100" =>
+        cos_output_s <= -"0000001011";
+      when "0100000101" =>
+        cos_output_s <= -"0000001010";
+      when "0100000110" =>
+        cos_output_s <= -"0000001000";
+      when "0100000111" =>
+        cos_output_s <= -"0000000111";
+      when "0100001000" =>
+        cos_output_s <= -"0000000110";
+      when "0100001001" =>
+        cos_output_s <= -"0000000101";
+      when "0100001010" =>
+        cos_output_s <= -"0000000100";
+      when "0100001011" =>
+        cos_output_s <= -"0000000011";
+      when "0100001100" =>
+        cos_output_s <= -"0000000010";
+      when "0100001101" =>
+        cos_output_s <= -"0000000001";
+      when "0100001110" =>                -- THETA = 270
+        cos_output_s <= "0000000000";
+	  when "0100001111" =>                -- THETA = 271
+        cos_output_s <= "0000000001";
+      when "0100010000" =>
+        cos_output_s <= "0000000010";
+      when "0100010001" =>
+        cos_output_s <= "0000000011";
+      when "0100010010" =>
+        cos_output_s <= "0000000100";
+      when "0100010011" =>
+        cos_output_s <= "0000000101";
+      when "0100010100" =>
+        cos_output_s <= "0000000110";
+      when "0100010101" =>
+        cos_output_s <= "0000000111";
+      when "0100010110" =>
+        cos_output_s <= "0000001000";
+      when "0100010111" => 
+        cos_output_s <= "0000001010";
+      when "0100011000" =>
+        cos_output_s <= "0000001011";
+      when "0100011001" =>
+        cos_output_s <= "0000001100";
+      when "0100011010" =>
+        cos_output_s <= "0000001101";
+      when "0100011011" =>
+        cos_output_s <= "0000001110";
+      when "0100011100" =>
+        cos_output_s <= "0000001111";
+      when "0100011101" =>
+        cos_output_s <= "0000010000";
+      when "0100011110" =>
+        cos_output_s <= "0000010001";
+      when "0100011111" =>
+        cos_output_s <= "0000010010";
+	  when "0100100000" =>
+        cos_output_s <= "0000010011";
+      when "0100100001" =>
+        cos_output_s <= "0000010100";
+      when "0100100010" =>
+        cos_output_s <= "0000010101";
+	  when "0100100011" =>
+        cos_output_s <= "0000010110";
+      when "0100100100" =>
+        cos_output_s <= "0000010111";
+      when "0100100101" =>
+        cos_output_s <= "0000011001";
+      when "0100100110" =>
+        cos_output_s <= "0000011010";
+      when "0100100111" =>
+        cos_output_s <= "0000011011";
+	  when "0100101000" =>
+        cos_output_s <= "0000011100";
+      when "0100101001" =>
+        cos_output_s <= "0000011101";
+	  when "0100101010" =>
+        cos_output_s <= "0000011110";
+	  when "0100101011" =>
+        cos_output_s <= "0000011111";
+      when "0100101100" =>
+        cos_output_s <= "0000011111";
+      when "0100101101" =>
+        cos_output_s <= "0000100000";
+      when "0100101110" =>
+        cos_output_s <= "0000100001";
+	  when "0100101111" =>
+        cos_output_s <= "0000100010";
+      when "0100110000" =>
+        cos_output_s <= "0000100011";
+	  when "0100110001" =>
+        cos_output_s <= "0000100100";
+	  when "0100110010" =>
+        cos_output_s <= "0000100101";
+      when "0100110011" =>
+        cos_output_s <= "0000100110";
+	  when "0100110100" =>
+        cos_output_s <= "0000100111";
+	  when "0100110101" =>
+        cos_output_s <= "0000101000";
+      when "0100110110" =>
+        cos_output_s <= "0000101001";
+	  when "0100110111" =>
+        cos_output_s <= "0000101001";
+	  when "0100111000" =>
+        cos_output_s <= "0000101010";
+	  when "0100111001" =>
+        cos_output_s <= "0000101011";
+      when "0100111010" =>
+        cos_output_s <= "0000101100";
+	  when "0100111011" =>
+        cos_output_s <= "0000101101";
+	  when "0100111100" =>
+        cos_output_s <= "0000101110";
+	  when "0100111101" =>
+        cos_output_s <= "0000101110";
+	  when "0100111110" =>
+        cos_output_s <= "0000101111";
+      when "0100111111" =>
+        cos_output_s <= "0000110000";
+      when "0101000000" =>
+        cos_output_s <= "0000110001";
+	  when "0101000001" =>
+        cos_output_s <= "0000110001";
+	  when "0101000010" =>
+        cos_output_s <= "0000110010";
+	  when "0101000011" =>
+        cos_output_s <= "0000110011";
+	  when "0101000100" =>
+        cos_output_s <= "0000110011";
+	  when "0101000101" =>
+        cos_output_s <= "0000110100";
+	  when "0101000110" =>
+        cos_output_s <= "0000110101";
+	  when "0101000111" =>
+        cos_output_s <= "0000110101";
+	  when "0101001000" =>
+        cos_output_s <= "0000110110";
+	  when "0101001001" =>
+        cos_output_s <= "0000110110";
+	  when "0101001010" =>
+        cos_output_s <= "0000110111";
+      when "0101001011" =>
+        cos_output_s <= "0000110111";
+	  when "0101001100" =>
+        cos_output_s <= "0000111000";
+	  when "0101001101" =>
+        cos_output_s <= "0000111001";
+	  when "0101001110" =>
+        cos_output_s <= "0000111001";
+	  when "0101001111" =>
+        cos_output_s <= "0000111010";
+	  when "0101010000" =>
+        cos_output_s <= "0000111010";
+	  when "0101010001" =>
+        cos_output_s <= "0000111010";
+	  when "0101010010" =>
+        cos_output_s <= "0000111011";
+	  when "0101010011" =>
+        cos_output_s <= "0000111011";
+	  when "0101010100" =>
+        cos_output_s <= "0000111100";
+	  when "0101010101" =>
+        cos_output_s <= "0000111100";
+	  when "0101010110" =>
+        cos_output_s <= "0000111100";
+	  when "0101010111" =>
+        cos_output_s <= "0000111101";
+	  when "0101011000" =>
+        cos_output_s <= "0000111101";
+	  when "0101011001" =>
+        cos_output_s <= "0000111101";
+	  when "0101011010" =>
+        cos_output_s <= "0000111110";
+	  when "0101011011" =>
+        cos_output_s <= "0000111110";
+	  when "0101011100" =>
+        cos_output_s <= "0000111110";
+	  when "0101011101" =>
+        cos_output_s <= "0000111110";
+	  when "0101011110" =>
+        cos_output_s <= "0000111111";
+	  when "0101011111" =>
+        cos_output_s <= "0000111111";
+	  when "0101100000" =>
+        cos_output_s <= "0000111111";
+	  when "0101100001" =>
+        cos_output_s <= "0000111111";
+	  when "0101100010" =>
+        cos_output_s <= "0000111111";
+	  when "0101100011" =>
+        cos_output_s <= "0000111111";
+	  when "0101100100" =>
+        cos_output_s <= "0000111111";
+	  when "0101100101" =>
+        cos_output_s <= "0000111111";
+	  when "0101100110" =>
+        cos_output_s <= "0000111111";
+	  when "0101100111" =>
+        cos_output_s <= "0000111111";
+	  when "0101101000" =>           -- THETA = 360
+        cos_output_s <= "0001000000";  
+      when others =>
+        cos_output_s <= (others => '1');
+    end case;
+  end process cosine_samples;
+
+end Behavioral;
