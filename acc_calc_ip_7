@@ -37,8 +37,6 @@ architecture Behavioral of acc_calc_ip is
   signal a_q_s : signed(9 downto 0);
   signal b_q_s : signed(9 downto 0);
   
-  --a constant used to check if the data contains a radius value
-  constant RAD_PIX_MASK : std_logic_vector(31 downto 0 ) := "10000000000000000000000000000000"; 
   --a constant to check if the data is valid
   constant INVALID_PIX_MASK : std_logic_vector(31 downto 0 ) := "10000000000000000000000000000000"; 
   --it is used to check if the theta has reached 360
@@ -134,7 +132,7 @@ begin
         s_ready <= '1';
         if(s_valid = '1') then
           --check if the data contains a radius value
-          if((s_data_in and RAD_PIX_MASK) = RAD_PIX_MASK) then
+          if(s_data_in(31) = '1') then
             radius_next <= s_data_in(9 downto 0);
           else
           --extracting x and y positions and placing in internal buffers
